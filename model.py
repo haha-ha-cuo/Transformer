@@ -8,119 +8,137 @@ class FortuneTellerConfig:
     模型配置类，方便统一管理超参数
     """
     def __init__(self):
-        self.vocab_size = 21128      # 词表大小 (先预设一个较小的值，后续根据数据调整)
+        self.vocab_size = 21128      # 词表大小
         self.d_model = 768          # 嵌入维度
         self.n_head = 12             # 注意力头数
-        self.n_layer = 6            # Transformer 层数
-        self.max_seq_len = 256      # 最大序列长度 (算命不需要太长)
+        self.n_layer = 12           # Transformer/RetNet 层数
+        self.max_seq_len = 256      # 最大序列长度
         self.dropout = 0.1          # Dropout 概率
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-class CausalSelfAttention(nn.Module):
+# ==============================================================
+# RetNet (Retentive Network) 实现
+# ==============================================================
+
+def build_decay_mask(seq_len, n_head, device):
     """
-    带掩码的自注意力机制 (Masked Self-Attention)
+    构建多尺度指数衰减掩码 (Multi-Scale Exponential Decay Mask)
+    """
+    # 根据论文: gamma = 1 - 2^(-5 - i)
+    gammas = 1 - 2 ** (-5 - torch.arange(n_head, dtype=torch.float, device=device))
+    
+    n = torch.arange(seq_len, device=device).unsqueeze(1)
+    m = torch.arange(seq_len, device=device).unsqueeze(0)
+    dist = n - m
+    mask = (dist >= 0).float() # 因果掩码
+    
+    # [n_head, seq_len, seq_len]
+    decay = gammas.view(-1, 1, 1) ** dist.clamp(min=0)
+    decay = decay * mask
+    return decay
+
+def get_rotary_emb(seq_len, d_head, device):
+    """
+    计算旋转位置编码
+    """
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, d_head, 2, device=device).float() / d_head))
+    t = torch.arange(seq_len, device=device, dtype=torch.float)
+    freqs = torch.einsum('i,j->ij', t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().unsqueeze(0).unsqueeze(0), emb.sin().unsqueeze(0).unsqueeze(0)
+
+def apply_rotary_pos_emb(x, cos, sin):
+    """应用旋转位置编码"""
+    d = x.shape[-1]
+    x1, x2 = x[..., :d//2], x[..., d//2:]
+    x_rot = torch.cat((-x2, x1), dim=-1)
+    return (x * cos) + (x_rot * sin)
+
+class MultiScaleRetention(nn.Module):
+    """
+    多尺度保留机制 (MSR, Multi-Scale Retention) 
     """
     def __init__(self, config):
         super().__init__()
-        assert config.d_model % config.n_head == 0
-        
-        self.c_attn = nn.Linear(config.d_model, 3 * config.d_model)
-        self.c_proj = nn.Linear(config.d_model, config.d_model)
-        
+        self.d_model = config.d_model
         self.n_head = config.n_head
-        self.d_head = config.d_model // config.n_head
+        self.d_head = self.d_model // self.n_head
         
-        # 注册一个 buffer 存储下三角掩码，用于因果注意力（只能看过去，不能看未来）
-        self.register_buffer("bias", torch.tril(torch.ones(config.max_seq_len, config.max_seq_len))
-                                     .view(1, 1, config.max_seq_len, config.max_seq_len))
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         
-        self.dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.group_norm = nn.GroupNorm(self.n_head, self.d_model)
 
     def forward(self, x):
-        B, T, C = x.size() # Batch, Time(seq_len), Channel(d_model)
+        B, T, C = x.size()
         
-        # 计算 query, key, value
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(C, dim=2)
+        q = self.q_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
         
-        # 拆分多头 (B, n_head, T, d_head)
-        k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        cos, sin = get_rotary_emb(T, self.d_head, x.device)
+        q = apply_rotary_pos_emb(q, cos, sin)
+        k = apply_rotary_pos_emb(k, cos, sin)
+        
+        decay_mask = build_decay_mask(T, self.n_head, x.device)
+        
+        qk = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
+        qk = qk * decay_mask.unsqueeze(0)
+        
+        out = qk @ v
+        
+        out = out.transpose(1, 2).contiguous().view(B * T, C)
+        out = self.group_norm(out)
+        out = out.view(B, T, C)
+        
+        return self.out_proj(out)
 
-        # 缩放点积注意力 (Scaled Dot-Product Attention)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        
-        # 应用掩码 (Masking) - 将未来位置设为负无穷
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        
-        y = att @ v # (B, n_head, T, d_head)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # 拼回 (B, T, C)
-        
-        return self.resid_dropout(self.c_proj(y))
-
-class MLP(nn.Module):
-    """
-    前馈神经网络 (Feed-Forward Network)
-    """
+class GLU(nn.Module):
+    """门控线性单元"""
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.d_model, 4 * config.d_model)
-        self.gelu    = nn.GELU() # 激活函数
-        self.c_proj  = nn.Linear(4 * config.d_model, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
-
+        self.fc1 = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
+        self.fc2 = nn.Linear(config.d_model, 2 * config.d_model, bias=False)
+        self.fc3 = nn.Linear(2 * config.d_model, config.d_model, bias=False)
+        
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.fc3(F.silu(self.fc1(x)) * self.fc2(x))
 
-class Block(nn.Module):
-    """
-    Transformer 块: Attention + MLP
-    """
+class RetNetBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.d_model)
-        self.attn = CausalSelfAttention(config)
+        self.retention = MultiScaleRetention(config)
         self.ln_2 = nn.LayerNorm(config.d_model)
-        self.mlp = MLP(config)
+        self.ffn = GLU(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.retention(self.ln_1(x))
+        x = x + self.ffn(self.ln_2(x))
         return x
 
 class FortuneTellerModel(nn.Module):
     """
-    算命模型主类 (基于 GPT 架构)
+    基于 RetNet 的模型 (被 train.py 调用)
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.d_model), # 词嵌入
-            wpe = nn.Embedding(config.max_seq_len, config.d_model), # 位置嵌入
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # 堆叠多层 Block
-            ln_f = nn.LayerNorm(config.d_model), # 最终归一化层
-        ))
+        self.wte = nn.Embedding(config.vocab_size, config.d_model)
+        self.drop = nn.Dropout(config.dropout)
         
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False) # 输出层
-
-        # 初始化权重
+        self.h = nn.ModuleList([RetNetBlock(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.d_model)
+        
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        
         self.apply(self._init_weights)
         
-        # 打印模型参数量
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"模型构建完成! 参数量: {n_params/1e6:.2f}M")
+        print(f"RetNet 模型构建完成! 参数量: {n_params/1e6:.2f}M")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -134,71 +152,32 @@ class FortuneTellerModel(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     def forward(self, idx, targets=None):
-        device = idx.device
         b, t = idx.size()
         
-        assert t <= self.config.max_seq_len, f"Cannot forward sequence of length {t}, block size is only {self.config.max_seq_len}"
+        tok_emb = self.wte(idx)
+        x = self.drop(tok_emb)
         
-        # 位置编码: [0, 1, 2, ..., t-1]
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) 
-
-        # Token embeddings + Position embeddings
-        tok_emb = self.transformer.wte(idx) 
-        pos_emb = self.transformer.wpe(pos) 
-        x = self.transformer.drop(tok_emb + pos_emb)
-        
-        # 通过 Transformer 块
-        for block in self.transformer.h:
+        for block in self.h:
             x = block(x)
             
-        x = self.transformer.ln_f(x)
-        
-        # 计算 logits
+        x = self.ln_f(x)
         logits = self.lm_head(x)
 
-        # 如果提供了目标值，计算损失
         loss = None
         if targets is not None:
-            # Flatten 之后计算交叉熵损失
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
         """
-        生成函数: 给定输入序列 idx，生成后续的 token
+        生成函数
         """
         for _ in range(max_new_tokens):
-            # 截断序列以适应最大长度
             idx_cond = idx[:, -self.config.max_seq_len:]
-            
-            # 前向传播
             logits, _ = self(idx_cond)
-            
-            # 取最后一个时间步的 logits
             logits = logits[:, -1, :]
-            
-            # 简单的贪婪采样 (后续可以加温度采样等)
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # 拼接生成的 token
             idx = torch.cat((idx, idx_next), dim=1)
-            
         return idx
-
-# 简单测试代码
-if __name__ == "__main__":
-    conf = FortuneTellerConfig()
-    model = FortuneTellerModel(conf).to(conf.device)
-    
-    # 模拟输入: Batch=1, SeqLen=10 的随机整数
-    dummy_input = torch.randint(0, conf.vocab_size, (1, 10)).to(conf.device)
-    
-    print(f"\n正在 {conf.device.upper()} 上运行前向传播测试...")
-    logits, loss = model(dummy_input)
-    print(f"输出 Logits 形状: {logits.shape}") # 预期: [1, 10, 5000]
-    
-    print("\n正在测试生成功能...")
-    generated = model.generate(dummy_input, max_new_tokens=5)
-    print(f"生成后序列形状: {generated.shape}") # 预期: [1, 15]

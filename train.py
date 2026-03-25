@@ -9,10 +9,10 @@ from model import FortuneTellerModel, FortuneTellerConfig
 # ==========================================
 class TrainConfig:
     data_path = 'fortune_data.txt'
-    batch_size = 2      # 演示用，设小一点
+    batch_size = 8      # 演示用，设小一点
     lr = 3e-4
-    epochs = 50         # 训练轮数
-    max_seq_len = 32    # 演示用，设短一点
+    epochs = 70         # 训练轮数
+    max_seq_len = 64   # 演示用，设短一点
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ==========================================
@@ -81,8 +81,8 @@ def train():
     model_config = FortuneTellerConfig()
     model_config.vocab_size = tokenizer.vocab_size # 同步词表大小 (21128)
     model_config.max_seq_len = TrainConfig.max_seq_len
-    model_config.d_model = 256 # 演示用，改小一点
-    model_config.n_layer = 4
+    model_config.d_model = 768 # 演示用，改小一点
+    model_config.n_layer = 12
     model_config.n_head = 4
     
     model = FortuneTellerModel(model_config).to(TrainConfig.device)
@@ -120,7 +120,7 @@ def train():
     print("\n[算命演示] 让模型接着说...")
     model.eval()
     
-    start_text = "甲木"
+    start_text = "《象》曰"
     print(f"输入提示: {start_text}")
     
     # 编码输入
