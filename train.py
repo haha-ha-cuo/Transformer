@@ -8,11 +8,11 @@ from model import FortuneTellerModel, FortuneTellerConfig
 # 1. 配置与准备
 # ==========================================
 class TrainConfig:
-    data_path = 'fortune_data.txt'
-    batch_size = 8      # 演示用，设小一点
+    data_path = 'fortune_data_clean.txt' # 使用清洗后的数据集
+    batch_size = 64      # 演示用，设小一点
     lr = 3e-4
-    epochs = 70         # 训练轮数
-    max_seq_len = 64   # 演示用，设短一点
+    epochs = 100         # 训练轮数
+    max_seq_len = 128   # 演示用，设短一点
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ==========================================
@@ -74,8 +74,16 @@ def train():
         tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
 
     # B. 准备数据加载器
+    # 使用 num_workers 开启多进程数据加载，pin_memory 加速数据到 GPU 的传输
     dataset = FortuneDataset(TrainConfig.data_path, tokenizer, TrainConfig.max_seq_len)
-    dataloader = DataLoader(dataset, batch_size=TrainConfig.batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=TrainConfig.batch_size, 
+        shuffle=True,
+        num_workers=4,          # 开启4个子进程加载数据
+        pin_memory=True,        # 锁页内存，加速 CPU 到 GPU 的数据拷贝
+        persistent_workers=True # 保持 worker 进程存活，避免每个 epoch 重新创建的开销
+    )
 
     # C. 初始化模型
     model_config = FortuneTellerConfig()
@@ -83,7 +91,7 @@ def train():
     model_config.max_seq_len = TrainConfig.max_seq_len
     model_config.d_model = 768 # 演示用，改小一点
     model_config.n_layer = 12
-    model_config.n_head = 4
+    model_config.n_head = 12
     
     model = FortuneTellerModel(model_config).to(TrainConfig.device)
     model.train()
